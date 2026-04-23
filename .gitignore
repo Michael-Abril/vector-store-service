@@ -1,0 +1,12 @@
+# Common ignores
+node_modules/
+__pycache__/
+*.pyc
+.env
+.env.local
+.env.*.local
+dist/
+build/
+.venv/
+venv/
+.DS_Store
