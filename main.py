@@ -31,7 +31,7 @@ def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
 
-def _wait_for_postgres(max_wait=300):
+def _wait_for_postgres(max_wait=600):
     deadline = time.time() + max_wait
     while time.time() < deadline:
         try:
@@ -39,8 +39,8 @@ def _wait_for_postgres(max_wait=300):
             conn.close()
             return
         except Exception:
-            time.sleep(3)
-    raise RuntimeError("Postgres not ready after 300s")
+            time.sleep(5)
+    raise RuntimeError("Postgres not ready after 600s")
 
 
 def _wait_for_ollama(max_wait=300):
