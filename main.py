@@ -80,7 +80,7 @@ def init_db():
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     wait_for_postgres()
     wait_for_ollama()
     pull_model()
