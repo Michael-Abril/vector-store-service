@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 import uuid
@@ -12,6 +13,8 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://varity:varity@localhost:5432/app")
 MODEL = "tinyllama"
 EMBED_DIM = 2048
+
+_state = {"ready": False, "error": None}
 
 
 def get_embedding(text: str) -> list[float]:
@@ -28,7 +31,7 @@ def get_conn():
     return psycopg2.connect(DATABASE_URL)
 
 
-def wait_for_postgres(max_wait=120):
+def _wait_for_postgres(max_wait=120):
     deadline = time.time() + max_wait
     while time.time() < deadline:
         try:
@@ -40,7 +43,7 @@ def wait_for_postgres(max_wait=120):
     raise RuntimeError("Postgres not ready after 120s")
 
 
-def wait_for_ollama(max_wait=300):
+def _wait_for_ollama(max_wait=300):
     deadline = time.time() + max_wait
     while time.time() < deadline:
         try:
@@ -53,7 +56,7 @@ def wait_for_ollama(max_wait=300):
     raise RuntimeError("Ollama not ready after 300s")
 
 
-def pull_model():
+def _pull_model():
     resp = requests.post(
         f"{OLLAMA_URL}/api/pull",
         json={"name": MODEL, "stream": False},
@@ -62,7 +65,7 @@ def pull_model():
     resp.raise_for_status()
 
 
-def init_db():
+def _init_db():
     conn = get_conn()
     try:
         with conn:
@@ -79,16 +82,33 @@ def init_db():
         conn.close()
 
 
+def _background_init():
+    try:
+        _wait_for_postgres()
+        _wait_for_ollama()
+        _pull_model()
+        _init_db()
+        _state["ready"] = True
+    except Exception as exc:
+        _state["error"] = str(exc)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    wait_for_postgres()
-    wait_for_ollama()
-    pull_model()
-    init_db()
+    # Start init in a thread so the HTTP server comes up immediately.
+    # Varity health check can then pass before sidecars are fully ready.
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _background_init)
     yield
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def _require_ready():
+    if not _state["ready"]:
+        detail = _state["error"] or "still initializing"
+        raise HTTPException(status_code=503, detail=detail)
 
 
 class IngestRequest(BaseModel):
@@ -98,22 +118,16 @@ class IngestRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    # verify both sidecars live
-    try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
-        r.raise_for_status()
-    except Exception:
-        raise HTTPException(status_code=503, detail="ollama not ready")
-    try:
-        conn = get_conn()
-        conn.close()
-    except Exception:
-        raise HTTPException(status_code=503, detail="postgres not ready")
+    if _state["error"]:
+        return {"status": "error", "detail": _state["error"]}
+    if not _state["ready"]:
+        return {"status": "initializing"}
     return {"status": "ready"}
 
 
 @app.post("/ingest")
 def ingest(req: IngestRequest):
+    _require_ready()
     doc_id = req.id or str(uuid.uuid4())
     embedding: list[float] = []
     for attempt in range(3):
@@ -123,7 +137,7 @@ def ingest(req: IngestRequest):
         except Exception:
             if attempt == 2:
                 raise HTTPException(status_code=503, detail="embedding failed")
-            pull_model()
+            _pull_model()
             time.sleep(5)
     conn = get_conn()
     try:
@@ -141,6 +155,7 @@ def ingest(req: IngestRequest):
 
 @app.get("/search")
 def search(q: str, k: int = 5):
+    _require_ready()
     embedding: list[float] = []
     for attempt in range(3):
         try:
@@ -149,14 +164,14 @@ def search(q: str, k: int = 5):
         except Exception:
             if attempt == 2:
                 raise HTTPException(status_code=503, detail="embedding failed")
-            pull_model()
+            _pull_model()
             time.sleep(5)
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                f"SELECT id, text, 1 - (embedding <=> %s::vector) AS score "
-                f"FROM documents ORDER BY embedding <=> %s::vector LIMIT %s",
+                "SELECT id, text, 1 - (embedding <=> %s::vector) AS score "
+                "FROM documents ORDER BY embedding <=> %s::vector LIMIT %s",
                 (str(embedding), str(embedding), k),
             )
             rows = cur.fetchall()
@@ -167,6 +182,7 @@ def search(q: str, k: int = 5):
 
 @app.get("/documents")
 def list_documents():
+    _require_ready()
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -179,6 +195,7 @@ def list_documents():
 
 @app.delete("/documents/{doc_id}")
 def delete_document(doc_id: str):
+    _require_ready()
     conn = get_conn()
     try:
         with conn:
